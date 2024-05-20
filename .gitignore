@@ -1,0 +1,10 @@
+# python
+**/*.egg-info/
+**/build
+**/__pycache__/
+
+# for mackbook
+**/.DS_Store
+**/.idea/
+
+setup.cfg
