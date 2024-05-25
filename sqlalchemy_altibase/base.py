@@ -27,10 +27,14 @@ from sqlalchemy.types import (
     FLOAT,
     INTEGER,
     NCHAR,
+    NVARCHAR,
     SMALLINT,
     VARCHAR,
 )
+from sqlalchemy import util
 from sqlalchemy.util import py2k, warn
+from itertools import groupby
+import re
 
 RESERVED_WORDS = set(
     [
@@ -322,6 +326,7 @@ ischema_names = {
     "VARCHAR": VARCHAR,
     "VARCHAR2": VARCHAR,
     "NCHAR": NCHAR,
+    "NVARCHAR": NVARCHAR,
     "CLOB": CLOB,
     "BLOB": BLOB,
     "NUMBER": oracle_base.NUMBER,
@@ -422,7 +427,7 @@ class AltibaseDialect(default.DefaultDialect):
         optimize_limits=False,
         use_binds_for_limits=None,
         use_nchar_for_unicode=False,
-        exclude_schemaspaces=("PUBLIC", "SYSTEM_", "SYS"),
+        exclude_schemaspaces=("PUBLIC", "SYSTEM_"),
         **kwargs,
     ):
         default.DefaultDialect.__init__(self, **kwargs)
@@ -474,10 +479,6 @@ class AltibaseDialect(default.DefaultDialect):
     def get_table_names(self, connection, schema=None, **kw):
         schema = self.denormalize_name(schema or self.default_schema_name)
 
-        # note that table_names() isn't loading DBLINKed or synonym'ed tables
-        if schema is None:
-            schema = self.default_schema_name
-
         query = "SELECT T.TABLE_NAME 'TABLE_NAME' FROM SYSTEM_.SYS_TABLES_ T, SYSTEM_.SYS_USERS_ U WHERE "
         if self.exclude_schemaspaces:
             query += "U.USER_NAME NOT IN (%s) AND " % (", ".join(["'%s'" % ts for ts in self.exclude_schemaspaces]))
@@ -489,15 +490,81 @@ class AltibaseDialect(default.DefaultDialect):
         )
 
         cursor = connection.execute(text(query), dict(schema_name=schema))
+        table_names = [self.normalize_name(row[0]) for row in cursor]
 
-        return [self.normalize_name(row[0]) for row in cursor]
+        return table_names
+
+    @reflection.cache
+    def get_indexes(
+        self,
+        connection,
+        table_name,
+        schema=None,
+        **kw
+    ):
+        schema = self.denormalize_name(schema or self.default_schema_name)
+
+        params = {"table_name": self.denormalize_name(table_name)}
+        params["schema"] = schema
+        query = (
+            "select i.index_name, c.column_name, i.is_unique "
+            "\n from system_.sys_users_ u, "
+            "\n system_.sys_tables_ t, "
+            "\n system_.sys_indices_ i, "
+            "\n system_.sys_index_columns_ ic, " 
+            "\n system_.sys_columns_ c "
+            "\n where u.user_name = :schema "
+            "\n and   u.user_id = t.user_id "
+            "\n and   t.table_name = :table_name "
+            "\n and   t.table_id = i.table_id "
+            "\n and   i.index_id = ic.index_id "
+            "\n and   i.table_id = ic.table_id "
+            "\n and   ic.table_id = c.table_id "
+            "\n and   ic.column_id = c.column_id "
+            "\n order by i.index_name, ic.index_col_order"
+        )
+
+        rp = connection.execute(text(query), params)
+        indexes = []
+        last_index_name = None
+        pk_constraint = self.get_pk_constraint(
+            connection,
+            table_name,
+            schema,
+        )
+
+        uniqueness = dict(F=False, T=True)
+
+        index = None
+        for rset in rp:
+            index_name_normalized = self.normalize_name(rset.index_name)
+
+            # skip primary key index.
+            if (
+                pk_constraint
+                and index_name_normalized == pk_constraint["name"]
+            ):
+                continue
+
+            if rset.index_name != last_index_name:
+                index = dict(
+                    name=index_name_normalized,
+                    column_names=[],
+                    dialect_options={},
+                )
+                indexes.append(index)
+            index["unique"] = uniqueness.get(rset.is_unique, False)
+
+            index["column_names"].append(
+                self.normalize_name(rset.column_name)
+            )
+            last_index_name = rset.index_name
+
+        return indexes
 
     @reflection.cache
     def get_columns(self, connection, table_name, schema=None, **kw):
         schema = self.denormalize_name(schema or self.default_schema_name)
-
-        if schema is None:
-            schema = self.default_schema_name
 
         query = """
             SELECT U.USER_NAME USER_NAME
@@ -512,7 +579,7 @@ class AltibaseDialect(default.DefaultDialect):
             INNER JOIN SYSTEM_.SYS_TABLES_ T ON U.USER_ID = T.USER_ID
             INNER JOIN SYSTEM_.SYS_COLUMNS_ C ON T.TABLE_ID = C.TABLE_ID
             LEFT OUTER JOIN SYSTEM_.SYS_COMMENTS_ COM ON T.TABLE_NAME = COM.TABLE_NAME AND C.COLUMN_NAME = COM.COLUMN_NAME AND U.USER_NAME = COM.USER_NAME
-        WHERE U.USER_NAME NOT IN ('PUBLIC', 'SYSTEM_', 'SYS')
+        WHERE U.USER_NAME NOT IN ('PUBLIC', 'SYSTEM_')
         AND U.USER_NAME = :schema_name
         AND T.TABLE_NAME = :table_name
         ORDER BY U.USER_NAME, T.TABLE_NAME, C.COLUMN_ORDER ;
@@ -539,7 +606,7 @@ class AltibaseDialect(default.DefaultDialect):
                     data_type = sqltypes.NULLTYPE
 
             column_dict = {
-                "name": column_name,
+                "name": self.normalize_name(column_name),
                 "type": data_type,
                 "nullable": nullable == "Y",
                 "default": data_default,
@@ -574,23 +641,31 @@ class AltibaseDialect(default.DefaultDialect):
         if schema is None:
             schema = self.default_schema_name
 
-        query = """SELECT CONST.CONSTRAINT_NAME CONSTRAINT_NAME
-            , DECODE(CONST.CONSTRAINT_TYPE, 0, 'FK', 1, 'NOT NULL', 2, 'UNIQUE', 3, 'PK', 4, 'NULL', 5, 'TIMESTAMP', 6, 'LOCAL UNIQUE', 7, 'CHECK') CONSTRAINT_TYPE
+        query = """SELECT CT.CONSTRAINT_NAME CONSTRAINT_NAME
+            , DECODE(CT.CONSTRAINT_TYPE, 0, 'FK', 1, 'NOT NULL', 2, 'UNIQUE', 3, 'PK', 4, 'NULL', 5, 'TIMESTAMP', 6, 'LOCAL UNIQUE', 7, 'CHECK') CONSTRAINT_TYPE
             , C.COLUMN_NAME COLUMN_NAME
-            , T.TABLE_NAME TABLE_NAME
-            , U.USER_NAME USER_NAME
-            , C.COLUMN_ORDER COLUMN_POSITION
-            , CONST.CHECK_CONDITION CHECK_CONDITION
-            , DECODE(CONST.DELETE_RULE, 0, 'NO ACTION', 1, 'CASCADE', 2, 'SET NULL') DELETE_RULE
+            , RT.TABLE_NAME RERERENCE_TABLE
+            , RC.COLUMN_NAME RERERENCE_COLUMN
+            , RU.USER_NAME RERERENCE_OWNER
+            , IX.INDEX_NAME INDEX_NAME
+            , CC.CONSTRAINT_COL_ORDER COLUMN_POSITION
+            , CT.CHECK_CONDITION CHECK_CONDITION
+            , DECODE(CT.DELETE_RULE, 0, 'NO ACTION', 1, 'CASCADE', 2, 'SET NULL') DELETE_RULE
          FROM SYSTEM_.SYS_USERS_ U
             , SYSTEM_.SYS_TABLES_ T
-              INNER JOIN SYSTEM_.SYS_COLUMNS_ C ON T.TABLE_ID = C.TABLE_ID
-              LEFT OUTER JOIN SYSTEM_.SYS_CONSTRAINT_COLUMNS_ CONST_COL ON CONST_COL.COLUMN_ID = C.COLUMN_ID
-              LEFT OUTER JOIN SYSTEM_.SYS_CONSTRAINTS_ CONST ON CONST.CONSTRAINT_ID = CONST_COL.CONSTRAINT_ID
+              INNER JOIN SYSTEM_.SYS_CONSTRAINTS_ CT ON CT.TABLE_ID = T.TABLE_ID
+              INNER JOIN SYSTEM_.SYS_CONSTRAINT_COLUMNS_ CC ON CC.CONSTRAINT_ID = CT.CONSTRAINT_ID
+              INNER JOIN SYSTEM_.SYS_COLUMNS_ C ON C.TABLE_ID = CC.TABLE_ID AND C.COLUMN_ID = CC.COLUMN_ID
+              LEFT  JOIN SYSTEM_.SYS_TABLES_ RT ON RT.TABLE_ID = CT.REFERENCED_TABLE_ID
+              LEFT  JOIN SYSTEM_.SYS_INDICES_ RI ON RI.INDEX_ID = CT.REFERENCED_INDEX_ID AND RI.TABLE_ID = CT.REFERENCED_TABLE_ID
+              LEFT  JOIN SYSTEM_.SYS_INDEX_COLUMNS_ RIC ON RIC.INDEX_ID = RI.INDEX_ID AND RIC.TABLE_ID = RI.TABLE_ID AND RIC.INDEX_COL_ORDER = CC.CONSTRAINT_COL_ORDER
+              LEFT  JOIN SYSTEM_.SYS_COLUMNS_ RC ON RC.TABLE_ID = RIC.TABLE_ID AND RC.COLUMN_ID = RIC.COLUMN_ID
+              LEFT  JOIN SYSTEM_.SYS_USERS_ RU ON RU.USER_ID = RT.USER_ID
+              LEFT  JOIN SYSTEM_.SYS_INDICES_ IX ON IX.INDEX_ID = CT.INDEX_ID AND IX.TABLE_ID = CT.TABLE_ID
         WHERE U.USER_ID = T.USER_ID
-        AND U.USER_NAME = CAST(:user_name AS VARCHAR(128))
-         AND T.TABLE_NAME = CAST(:table_name AS VARCHAR(128))
-         ORDER BY CONST.CONSTRAINT_NAME, C.COLUMN_ORDER ;
+        AND   U.USER_NAME = :user_name
+        AND   T.TABLE_NAME = :table_name
+        ORDER BY CT.CONSTRAINT_NAME, CC.CONSTRAINT_COL_ORDER ;
          """
 
         rp = connection.execute(
@@ -618,13 +693,19 @@ class AltibaseDialect(default.DefaultDialect):
             if cons_type == "PK":
                 if constraint_name is None:
                     constraint_name = self.normalize_name(cons_name)
-                pkeys.append(local_column)
+                pkeys.append(self.normalize_name(local_column))
 
         return {"constrained_columns": pkeys, "name": constraint_name}
 
     @reflection.cache
     def get_foreign_keys(self, connection, table_name, schema=None, **kw):
+        """
+        kw arguments can be:
+            dblink
+        """
+        requested_schema = schema  # to check later on
         dblink = kw.get("dblink", "")
+        info_cache = kw.get("info_cache")
 
         constraint_data = self._get_constraint_data(
             connection,
@@ -634,9 +715,19 @@ class AltibaseDialect(default.DefaultDialect):
             info_cache=kw.get("info_cache"),
         )
 
-        fkeys = []
+        def fkey_rec():
+            return {
+                "name": None,
+                "constrained_columns": [],
+                "referred_schema": None,
+                "referred_table": None,
+                "referred_columns": [],
+                "options": {},
+            }
 
-        for spec in constraint_data:
+        fkeys = util.defaultdict(fkey_rec)
+
+        for row in constraint_data:
             (
                 cons_name,
                 cons_type,
@@ -644,34 +735,85 @@ class AltibaseDialect(default.DefaultDialect):
                 remote_table,
                 remote_column,
                 remote_owner,
-            ) = (
-                spec[0:2] + tuple([self.normalize_name(x) for x in spec[2:5]]) + spec[5:6]
-            )
+            ) = row[0:2] + tuple([self.normalize_name(x) for x in row[2:6]])
+
+            cons_name = self.normalize_name(cons_name)
 
             if cons_type == "FK":
-                if remote_table is None:
-                    warn(
-                        (
-                            "Got 'None' querying 'table_name' from "
-                            "all_cons_columns%(dblink)s - does the user have "
-                            "proper rights to the table?"
-                        )
-                        % {"dblink": dblink}
-                    )
-                    continue
+                rec = fkeys[cons_name]
+                rec["name"] = cons_name
+                local_cols, remote_cols = (
+                    rec["constrained_columns"],
+                    rec["referred_columns"],
+                )
 
-                fkey_d = {
-                    "name": cons_name,
-                    "constrained_columns": [],
-                    "referred_schema": remote_column,
-                    "referred_table": remote_table,
-                    "referred_columns": [],
-                    "options": {},
-                }
+                if not rec["referred_table"]:
+                    rec["referred_table"] = remote_table
+                    rec["referred_schema"] = remote_owner
 
-                fkeys.append(fkey_d)
+                    if row[9] != "NO ACTION":
+                        rec["options"]["ondelete"] = row[9]
 
-        return fkeys
+                local_cols.append(local_column)
+                remote_cols.append(remote_column)
+
+        return list(fkeys.values())
+
+    @reflection.cache
+    def get_unique_constraints(
+        self, connection, table_name, schema=None, **kw
+    ):
+        dblink = kw.get("dblink", "")
+        info_cache = kw.get("info_cache")
+
+        constraint_data = self._get_constraint_data(
+            connection,
+            table_name,
+            schema,
+            dblink,
+            info_cache=kw.get("info_cache"),
+        )
+
+        unique_keys = filter(lambda x: x[1] == "UNIQUE", constraint_data)
+        uniques_group = groupby(unique_keys, lambda x: x[0])
+
+        return [
+            {
+                "name": name,
+                "column_names": cols,
+                "duplicates_index": index_name,
+            }
+            for name, index_name, cols in [
+                [
+                    self.normalize_name(i[0]),
+                    self.normalize_name(list(i[1])[0][6]),
+                    [self.normalize_name(x[2]) for x in i[1]],
+                ]
+                for i in uniques_group
+            ]
+        ]
+
+    @reflection.cache
+    def get_check_constraints(
+        self, connection, table_name, schema=None, **kw
+    ):
+        dblink = kw.get("dblink", "")
+        info_cache = kw.get("info_cache")
+
+        constraint_data = self._get_constraint_data(
+            connection,
+            table_name,
+            schema,
+            dblink,
+            info_cache=kw.get("info_cache"),
+        )
+
+        check_constraints = filter(lambda x: x[1] == "CHECK", constraint_data)
+
+        return [
+            {"name": self.normalize_name(cons[0]), "sqltext": cons[8]}
+            for cons in check_constraints
+        ]
 
     @reflection.cache
     def get_view_names(self, connection, schema=None, **kw):
@@ -691,21 +833,19 @@ class AltibaseDialect(default.DefaultDialect):
 
     @reflection.cache
     def get_view_definition(self, connection, view_name, schema=None, resolve_synonyms=False, dblink="", **kw):
+        schema = self.denormalize_name(schema or self.default_schema_name)
         query = """
             SELECT P.PARSE FROM SYSTEM_.SYS_TABLES_ T
        	        INNER JOIN SYSTEM_.SYS_USERS_ U ON U.USER_ID = T.USER_ID
        	        INNER JOIN SYSTEM_.SYS_VIEW_PARSE_ P ON T.TABLE_ID = P.VIEW_ID
        	        WHERE T.TABLE_TYPE = 'V'
        	        AND T.TABLE_NAME = :view_name
+                AND U.USER_NAME = :user_name
+                ORDER BY P.SEQ_NO ASC
                """
 
         params = {"view_name": self.denormalize_name(view_name)}
-
-        if schema is not None:
-            query += " AND U.USER_NAME = :user_name"
-            params["user_name"] = self.denormalize_name(schema)
-
-        query += " ORDER BY P.SEQ_NO ASC"
+        params["user_name"] = self.denormalize_name(schema)
 
         rp = "".join(connection.execute(text(query), params).scalars().all())
 
